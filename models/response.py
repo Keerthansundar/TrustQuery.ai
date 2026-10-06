@@ -14,7 +14,7 @@ class ToolResult(BaseModel):
     truncated: bool = False            # True if the DB row cap cut the result
     elapsed_ms: float = 0.0
     error: Optional[str] = None
-    error_type: Optional[Literal["validation", "execution", "timeout"]] = None
+    error_type: Optional[Literal["validation", "lint", "execution", "timeout"]] = None
 
 
 class LLMAnswer(BaseModel):
@@ -37,7 +37,7 @@ class AnalystResponse(BaseModel):
     data_used: list[str] = []
     requires_clarification: bool = False
 
-    status: Literal["success", "clarification", "failed", "error"] = "success"
+    status: Literal["success", "clarification", "abstained", "refused", "failed", "error"] = "success"
     grounding_status: Literal["verified", "repaired", "fallback", "n/a"] = "n/a"
     error: Optional[str] = None
 
@@ -46,7 +46,10 @@ class AnalystResponse(BaseModel):
     row_count: int = 0
     truncated: bool = False
     sources: list[str] = []
-
+    plan: str = ""                     # planner summary, e.g. 'diagnostic (complex) - September 2026 vs August 2026'
+    warnings: list[str] = []           # unresolved business-rule lint issues (shown to the user)
+    tool_call_rescued: bool = False    # model wrote the tool call as text; recovered by Python
+    
     sql_attempts: int = 0
     answer_repairs: int = 0
     timings_ms: dict[str, float] = {}

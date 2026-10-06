@@ -1,134 +1,509 @@
-"""TrustQuery AI - Streamlit UI.  Run: streamlit run app.py"""
-import pandas as pd
+import os
+from pathlib import Path
+
 import streamlit as st
 
 from agent.agent import DataAnalystAgent
-from agent.memory import Turn, build_history_messages
+from agent.memory import Turn, build_followup_context
 from config import get_settings
-from scripts.seed_database import build_database
 
-st.set_page_config(page_title="TrustQuery AI", page_icon="🔎", layout="wide")
+
+# ---------------------------------------------------------
+# PAGE CONFIG
+# ---------------------------------------------------------
+
+st.set_page_config(
+    page_title="TrustQuery AI",
+    page_icon="🔎",
+    layout="wide",
+)
+
+
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
 settings = get_settings()
 
-EXAMPLES = [
-    "What was our revenue in September?",
-    "Which product had the highest revenue in September?",
-    "Show me the top 5 customers by revenue.",
-    "Why did revenue decrease in September compared with August?",
-]
-GROUNDING_BADGE = {
-    "verified": ("success", "All numbers in this answer were verified against the query result."),
-    "repaired": ("success", "Numbers verified (the answer was auto-corrected once)."),
-    "fallback": ("warning", "The model's wording could not be verified, so this is a direct summary of the query result."),
-}
 
+# ---------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------
+
+DB_PATH = Path(settings.db_path)
+
+
+# ---------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------
+
+if "turns" not in st.session_state:
+    st.session_state.turns = []
+
+
+# ---------------------------------------------------------
+# AGENT
+# ---------------------------------------------------------
 
 @st.cache_resource
 def get_agent() -> DataAnalystAgent:
-    if not settings.db_path.exists():
-        build_database(settings.db_path)
     return DataAnalystAgent()
 
 
-def ollama_status(agent: DataAnalystAgent) -> tuple[bool, str]:
-    try:
-        names = [m.model for m in agent.client.list().models]
-    except Exception:
-        return False, f"Ollama is not reachable at {settings.ollama_host}. Start it with `ollama serve`."
-    if settings.llm_model not in names:
-        return False, f"Model not found. Run `ollama pull {settings.llm_model}`."
-    return True, f"Ollama connected - {settings.llm_model}"
+# ---------------------------------------------------------
+# DATABASE INITIALIZATION
+# ---------------------------------------------------------
 
+def ensure_database() -> None:
+    """Create the database if it does not already exist."""
+
+    if DB_PATH.exists():
+        return
+
+    try:
+        from scripts.seed_database import build_database
+
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        build_database(str(DB_PATH))
+
+    except Exception as exc:
+        st.error(f"Could not initialize database: {exc}")
+
+
+# ---------------------------------------------------------
+# OLLAMA STATUS
+# ---------------------------------------------------------
+
+def check_ollama_status() -> tuple[bool, str]:
+    """Check whether Ollama is reachable."""
+
+    try:
+        import ollama
+
+        client = ollama.Client(host=settings.ollama_host)
+
+        response = client.list()
+
+        models = []
+
+        if hasattr(response, "models"):
+            models = response.models
+
+        model_names = []
+
+        for model in models:
+            if hasattr(model, "model"):
+                model_names.append(model.model)
+            elif isinstance(model, dict):
+                model_names.append(model.get("name", ""))
+
+        if settings.llm_model in model_names:
+            return True, f"Ollama connected — {settings.llm_model}"
+
+        return True, (
+            f"Ollama connected, but model '{settings.llm_model}' "
+            "was not found."
+        )
+
+    except Exception as exc:
+        return False, f"Ollama unavailable: {exc}"
+
+
+# ---------------------------------------------------------
+# ASK AGENT
+# ---------------------------------------------------------
 
 def ask(question: str) -> None:
-    history = build_history_messages(st.session_state.turns, settings.history_turns)
-    with st.spinner("Writing SQL, running it, and checking the answer..."):
-        resp = get_agent().run(question, history)
-    st.session_state.turns.append(Turn(question, resp.answer, resp.sql, resp))
+    """Send a question to TrustQuery AI."""
 
+    question = question.strip()
 
-def render_answer(turn: Turn) -> None:
-    r = turn.response
-    st.markdown(f"**You asked:** {turn.question}")
-    if r.status in ("failed", "error"):
-        st.error(r.answer)
+    if not question:
         return
-    if r.status == "clarification":
-        st.info(r.answer)
+
+    context = build_followup_context(
+        st.session_state.turns,
+        settings.history_turns,
+    )
+
+    with st.spinner(
+        "Writing SQL, running it, and checking the answer..."
+    ):
+        try:
+            resp = get_agent().run(
+                question,
+                context,
+            )
+
+            # Store conversation turn
+            st.session_state.turns.append(
+                Turn(
+                    question=question,
+                    answer=resp.answer,
+                    sql=resp.sql or "",
+                    response=resp,
+                )
+            )
+
+        except Exception as exc:
+            st.error(f"Something went wrong: {exc}")
+
+
+# ---------------------------------------------------------
+# RENDER ANSWER
+# ---------------------------------------------------------
+
+def render_answer(resp) -> None:
+    """Render an AnalystResponse."""
+
+    if resp is None:
         return
-    st.subheader("Answer")
-    st.markdown(r.answer)
-    level, msg = GROUNDING_BADGE.get(r.grounding_status, ("info", ""))
-    getattr(st, level)(msg, icon="✅" if level == "success" else "⚠️")
-    if r.truncated:
-        st.caption(f"Result capped at {settings.max_rows} rows.")
-    with st.expander(f"Query result ({r.row_count} rows)"):
-        st.dataframe(pd.DataFrame(r.rows, columns=r.columns), use_container_width=True, hide_index=True)
-    if r.reasoning_summary:
-        st.caption(f"How this was answered: {r.reasoning_summary}")
-    st.markdown("**Sources**")
-    for src in r.sources:
-        st.markdown(f"- {src}")
 
+    # -----------------------------------------------------
+    # Status
+    # -----------------------------------------------------
 
-def render_sidebar(turn: Turn | None, agent: DataAnalystAgent) -> None:
-    with st.sidebar:
-        st.header("SQL Reference")
-        if turn and turn.response.executed:
-            r = turn.response
-            st.code(r.sql, language="sql")
-            st.success("SQL validated", icon="✅")
-            st.success("Query executed", icon="✅")
-            if r.sql_attempts > 1:
-                st.caption(f"Corrected after {r.sql_attempts - 1} retry.")
-            st.subheader("Execution")
-            t = r.timings_ms
-            st.markdown(
-                f"- SQL generation: **{t.get('llm_sql_ms', 0):.0f} ms**\n"
-                f"- SQL execution: **{t.get('sql_exec_ms', 0):.0f} ms**\n"
-                f"- Final response: **{t.get('llm_answer_ms', 0):.0f} ms**\n"
-                f"- Total: **{t.get('total_ms', 0) / 1000:.2f} s**")
-        elif turn:
-            st.info("No SQL was executed for this question.")
+    if resp.status == "success":
+        st.success("Query executed successfully")
+
+    elif resp.status == "failed":
+        st.warning("The query could not be executed.")
+
+    elif resp.status == "error":
+        st.error("An error occurred while processing the question.")
+
+    # -----------------------------------------------------
+    # Grounding status
+    # -----------------------------------------------------
+
+    grounding_status = getattr(
+        resp,
+        "grounding_status",
+        None,
+    )
+
+    if grounding_status:
+        if grounding_status == "verified":
+            st.caption("🟢 Answer verified against database results")
+
+        elif grounding_status == "repaired":
+            st.caption("🟡 Answer repaired and verified")
+
+        elif grounding_status == "fallback":
+            st.caption("🟠 Deterministic fallback used")
+
         else:
-            st.caption("The exact SQL that runs against the database will appear here.")
+            st.caption(
+                f"Grounding status: {grounding_status}"
+            )
+
+    # -----------------------------------------------------
+    # Answer
+    # -----------------------------------------------------
+
+    st.markdown("### Answer")
+
+    if resp.answer:
+        st.write(resp.answer)
+    else:
+        st.write("No answer was generated.")
+
+    # -----------------------------------------------------
+    # Query Result
+    # -----------------------------------------------------
+
+    columns = getattr(resp, "columns", None)
+    rows = getattr(resp, "rows", None)
+
+    if columns and rows is not None:
+
+        st.markdown("### Query Result")
+
+        try:
+            import pandas as pd
+
+            dataframe = pd.DataFrame(
+                rows,
+                columns=columns,
+            )
+
+            st.dataframe(
+                dataframe,
+                use_container_width=True,
+            )
+
+        except Exception:
+            st.write(rows)
+
+    # -----------------------------------------------------
+    # Reasoning Summary
+    # -----------------------------------------------------
+
+    reasoning_summary = getattr(
+        resp,
+        "reasoning_summary",
+        None,
+    )
+
+    if reasoning_summary:
+        with st.expander("Reasoning Summary"):
+            st.write(reasoning_summary)
+
+    # -----------------------------------------------------
+    # Data Used
+    # -----------------------------------------------------
+
+    data_used = getattr(
+        resp,
+        "data_used",
+        None,
+    )
+
+    if data_used:
+        with st.expander("Data Used"):
+            for item in data_used:
+                st.write(f"- {item}")
+
+    # -----------------------------------------------------
+    # Errors
+    # -----------------------------------------------------
+
+    error = getattr(
+        resp,
+        "error",
+        None,
+    )
+
+    if error:
+        with st.expander("Details"):
+            st.error(error)
+
+
+# ---------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------
+
+def render_sidebar() -> None:
+
+    with st.sidebar:
+
+        st.title("🔎 TrustQuery AI")
+
+        st.caption(
+            "Natural-language business analytics powered by "
+            "Qwen2.5 + SQLite"
+        )
+
         st.divider()
-        ok, msg = ollama_status(agent)
-        (st.success if ok else st.error)(msg, icon="🟢" if ok else "🔴")
-        st.caption("Phase 2: full docs in prompt. RAG arrives in Phase 3.")
+
+        # -------------------------------------------------
+        # Ollama
+        # -------------------------------------------------
+
+        st.subheader("Ollama")
+
+        ollama_ok, ollama_message = check_ollama_status()
+
+        if ollama_ok:
+            st.success(ollama_message)
+        else:
+            st.error(ollama_message)
+
+        st.divider()
+
+        # -------------------------------------------------
+        # Latest SQL
+        # -------------------------------------------------
+
+        st.subheader("Executed SQL")
+
+        if st.session_state.turns:
+
+            latest_turn = st.session_state.turns[-1]
+
+            if latest_turn.sql:
+
+                st.code(
+                    latest_turn.sql,
+                    language="sql",
+                )
+
+            else:
+                st.caption(
+                    "No SQL was executed for this question."
+                )
+
+            # -------------------------------------------------
+            # Execution information
+            # -------------------------------------------------
+
+            resp = latest_turn.response
+
+            if resp is not None:
+
+                st.markdown("### Query Status")
+
+                executed = getattr(
+                    resp,
+                    "executed",
+                    False,
+                )
+
+                if executed:
+                    st.success("Executed")
+
+                else:
+                    st.warning("Not executed")
+
+                # SQL attempts
+                sql_attempts = getattr(
+                    resp,
+                    "sql_attempts",
+                    None,
+                )
+
+                if sql_attempts is not None:
+                    st.caption(
+                        f"SQL attempts: {sql_attempts}"
+                    )
+
+                # Answer repairs
+                answer_repairs = getattr(
+                    resp,
+                    "answer_repairs",
+                    None,
+                )
+
+                if answer_repairs is not None:
+                    st.caption(
+                        f"Answer repairs: {answer_repairs}"
+                    )
+
+                # Timing
+                timings = getattr(
+                    resp,
+                    "timings_ms",
+                    None,
+                )
+
+                if timings:
+
+                    st.markdown("### Timing")
+
+                    for key, value in timings.items():
+
+                        label = key.replace(
+                            "_",
+                            " ",
+                        ).title()
+
+                        st.caption(
+                            f"{label}: {value} ms"
+                        )
+
+        else:
+
+            st.caption(
+                "Ask a question to see the executed SQL."
+            )
+
+        st.divider()
+
+        # -------------------------------------------------
+        # Clear history
+        # -------------------------------------------------
+
+        if st.button(
+            "Clear Conversation",
+            use_container_width=True,
+        ):
+            st.session_state.turns = []
+            st.rerun()
 
 
-# ----------------------------------------------------------------------------- page
-agent = get_agent()
-st.session_state.setdefault("turns", [])
+# ---------------------------------------------------------
+# MAIN UI
+# ---------------------------------------------------------
 
-st.title("TrustQuery AI")
-st.caption("Ask business questions in plain English. Get trustworthy answers backed by executable SQL.")
+ensure_database()
 
-with st.form("ask_form"):
-    q = st.text_input("Ask a question about your business data",
-                      placeholder="e.g. Why did revenue decrease in September?")
-    submitted = st.form_submit_button("Ask", type="primary")
+render_sidebar()
 
-st.caption("Try one:")
-cols = st.columns(len(EXAMPLES))
-for col, ex in zip(cols, EXAMPLES):
-    col.button(ex, use_container_width=True, key=f"ex_{ex}",
-               on_click=lambda e=ex: st.session_state.update(pending=e))
 
-question = st.session_state.pop("pending", None) or (q.strip() if submitted and q.strip() else None)
+st.title("🔎 TrustQuery AI")
+
+st.markdown(
+    """
+Ask business questions in plain English and TrustQuery AI will:
+
+1. Generate a read-only SQL query
+2. Validate the SQL using SQLGlot
+3. Execute it against SQLite
+4. Ground the answer using the database result
+5. Verify the generated answer
+6. Repair or fall back if the answer is inconsistent
+"""
+)
+
+
+# ---------------------------------------------------------
+# EXAMPLE QUESTIONS
+# ---------------------------------------------------------
+
+st.markdown("### Try an example")
+
+examples = [
+    "What was our revenue in September?",
+    "Which product had the highest revenue in September?",
+    "Show the top 5 customers by revenue.",
+    "Why did revenue decrease in September compared with August?",
+]
+
+cols = st.columns(2)
+
+for index, example in enumerate(examples):
+
+    with cols[index % 2]:
+
+        if st.button(
+            example,
+            key=f"example_{index}",
+            use_container_width=True,
+        ):
+            ask(example)
+            st.rerun()
+
+
+# ---------------------------------------------------------
+# QUESTION INPUT
+# ---------------------------------------------------------
+
+question = st.chat_input(
+    "Ask a business question..."
+)
+
+
 if question:
+
+    # Display user question
+    with st.chat_message("user"):
+        st.write(question)
+
+    # Execute agent
     ask(question)
 
-turns: list[Turn] = st.session_state.turns
-st.divider()
-if turns:
-    render_answer(turns[-1])
-    if len(turns) > 1:
-        with st.expander("Earlier questions"):
-            for t in reversed(turns[:-1]):
-                st.markdown(f"**{t.question}**  \n{t.answer}")
-else:
-    st.info("Ask a question above or pick an example to get started.")
+    # Refresh UI
+    st.rerun()
 
-render_sidebar(turns[-1] if turns else None, agent)
+
+# ---------------------------------------------------------
+# CONVERSATION HISTORY
+# ---------------------------------------------------------
+
+for turn in st.session_state.turns:
+
+    with st.chat_message("user"):
+        st.write(turn.question)
+
+    with st.chat_message("assistant"):
+        render_answer(turn.response)

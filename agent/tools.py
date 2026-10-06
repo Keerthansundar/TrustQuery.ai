@@ -99,26 +99,79 @@ def execute_sql(sql: str) -> ToolResult:
 
 
 # ---------------------------------------------------------------------------
-# SQL extraction
+# SQL extraction patterns
 # ---------------------------------------------------------------------------
 
+# ```sql
+# SELECT ...
+# ```
 _FENCE = re.compile(
     r"```(?:sql)?\s*(.*?)```",
     re.IGNORECASE | re.DOTALL,
 )
 
+# <tool_call> ... </tool_call>
 _TOOL_TAGS = re.compile(
     r"</?tool_call>",
     re.IGNORECASE,
 )
 
+# Supports:
+#
+# SQL: SELECT ...
+# [SQL: SELECT ...]
+# execute_sql: SELECT ...
+# query: SELECT ...
+#
+# anywhere in the text.
+_LABELLED = re.compile(
+    r"\b(?:execute_sql|sql|query)\s*:\s*\(?\s*((?:select|with)\b[^\]]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# SQLGlot AST types that represent SELECT-style queries.
+_QUERY_ROOTS = (
+    exp.Select,
+    exp.Union,
+    exp.Except,
+    exp.Intersect,
+)
+
+# Money, grouped numbers, long numbers or percentages:
+# these can indicate that an LLM has invented database results.
+_MADE_UP = re.compile(
+    r"₹|\d{1,3}(?:,\d{2,3})+|\b\d{5,}\b|\d+(?:\.\d+)?\s?%",
+)
+
+
+def looks_like_made_up_results(text: str) -> bool:
+    """Return True if a text-only reply contains result-like numbers.
+
+    A genuine clarifying question generally does not need database-result
+    numbers. This helper can therefore be used by the agent layer to prevent
+    hallucinated numerical answers from being shown to the user.
+
+    Examples detected:
+        ₹50,000
+        12,500
+        123456
+        15%
+        42.5%
+    """
+
+    return bool(_MADE_UP.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# SQL normalization
+# ---------------------------------------------------------------------------
 
 def _normalize_sql(sql: str) -> str:
     """Normalize common LLM-generated SQL variations."""
 
     sql = sql.replace("≥", ">=")
     sql = sql.replace("≤", "<=")
-    sql = sql.replace("≠", "<>")
+    sql = sql.replace("≠", "!=")
 
     # Remove non-breaking spaces.
     sql = sql.replace("\u00a0", " ")
@@ -126,16 +179,22 @@ def _normalize_sql(sql: str) -> str:
     return sql.strip()
 
 
+# ---------------------------------------------------------------------------
+# SQL extraction
+# ---------------------------------------------------------------------------
+
 def extract_sql_from_text(text: str) -> Optional[str]:
     """Extract SQL when a local LLM outputs SQL as plain text.
 
-    Supported formats:
+    Supported formats include:
 
         SQL: SELECT ...
 
+        [SQL: SELECT ...]
+
         execute_sql: SELECT ...
 
-        SELECT ...
+        query: SELECT ...
 
         ```sql
         SELECT ...
@@ -143,29 +202,37 @@ def extract_sql_from_text(text: str) -> Optional[str]:
 
         {"arguments": {"sql": "SELECT ..."}}
 
+        {"parameters": {"sql": "SELECT ..."}}
+
+        {"sql": "SELECT ..."}
+
     The extracted SQL is returned to agent.py.
 
-    It must then be passed through execute_sql(), which performs
-    the final validation before touching the database.
+    It MUST then be passed through execute_sql(), which performs the
+    final validation before touching the database.
+
+    Normal prose such as a clarifying question returns None and is
+    never treated as SQL.
     """
 
-    if not text:
-        return None
-
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # Basic cleanup
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    t = _TOOL_TAGS.sub("", text).strip()
+    t = _TOOL_TAGS.sub("", (text or "")).strip()
 
     if not t:
         return None
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # JSON tool-call style output
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    if t[0] in "{[":
+    if t[0] in "{[" and not re.match(
+        r"\[\s*(?:execute_sql|sql|query)\s*:",
+        t,
+        re.IGNORECASE,
+    ):
         try:
             obj = json.loads(t)
 
@@ -197,52 +264,49 @@ def extract_sql_from_text(text: str) -> Optional[str]:
             TypeError,
             KeyError,
         ):
-            pass
+            return None
 
-    # ---------------------------------------------------------
-    # Code-fenced SQL
+    # ------------------------------------------------------------------
+    # Detect labelled SQL or fenced SQL
+    #
+    # Examples:
+    #
+    # SQL: SELECT ...
+    #
+    # execute_sql: SELECT ...
+    #
+    # query: SELECT ...
     #
     # ```sql
     # SELECT ...
     # ```
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
+    labelled = _LABELLED.search(t)
     fence = _FENCE.search(t)
 
-    if fence:
-        t = fence.group(1).strip()
+    if labelled:
+        t = labelled.group(1)
 
-    # ---------------------------------------------------------
+    elif fence:
+        t = fence.group(1)
+
+    # ------------------------------------------------------------------
     # Remove common SQL prefixes
     #
-    # SQL:
-    # execute_sql:
-    # query:
-    # ---------------------------------------------------------
+    # This handles cases that weren't caught by _LABELLED.
+    # ------------------------------------------------------------------
 
     t = re.sub(
-        r"^\s*(?:SQL|execute_sql|query)\s*:\s*",
+        r"^\s*(?:execute_sql|sql|query)\s*[:(]\s*",
         "",
-        t,
-        count=1,
+        t.strip(),
         flags=re.IGNORECASE,
-    ).strip()
+    )
 
-    # ---------------------------------------------------------
-    # Normalize Unicode SQL operators BEFORE SQLGlot parsing.
-    #
-    # Qwen may produce:
-    #
-    # order_date ≥ '2026-09-01'
-    #
-    # Convert to:
-    #
-    # order_date >= '2026-09-01'
-    # ---------------------------------------------------------
+    t = t.strip()
 
-    t = _normalize_sql(t)
-
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # Remove explanation after a blank line.
     #
     # Example:
@@ -252,26 +316,41 @@ def extract_sql_from_text(text: str) -> Optional[str]:
     # This query calculates September revenue...
     #
     # Keep only SQL.
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
     t = t.split("\n\n")[0].strip()
 
     if not t:
         return None
 
-    # ---------------------------------------------------------
-    # SQL must begin with SELECT or WITH.
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Normalize Unicode SQL operators.
+    #
+    # Qwen may produce:
+    #
+    # order_date ≥ '2026-09-01'
+    #
+    # Convert to:
+    #
+    # order_date >= '2026-09-01'
+    # ------------------------------------------------------------------
 
-    if not re.match(r"(?is)^(SELECT|WITH)\b", t):
+    t = _normalize_sql(t)
+
+    # ------------------------------------------------------------------
+    # SQL must begin with SELECT or WITH.
+    # ------------------------------------------------------------------
+
+    if not re.match(r"(?is)^(select|with)\b", t):
         return None
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # Parse using SQLGlot.
     #
-    # This checks whether the text is valid SQLite SQL.
+    # This checks whether the text resembles valid SQLite SQL.
+    #
     # Actual security validation happens inside validate_sql().
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
     try:
         trees = [
@@ -283,23 +362,21 @@ def extract_sql_from_text(text: str) -> Optional[str]:
     except SqlglotError:
         return None
 
+    # ------------------------------------------------------------------
+    # No valid SQL AST.
+    # ------------------------------------------------------------------
+
     if not trees:
         return None
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # Only allow SELECT-style statements here.
-    # validate_sql() performs the final safety validation.
-    # ---------------------------------------------------------
+    #
+    # Multi-statement text is intentionally left to validate_sql(),
+    # which should reject it explicitly.
+    # ------------------------------------------------------------------
 
-    if isinstance(
-        trees[0],
-        (
-            exp.Select,
-            exp.Union,
-            exp.Except,
-            exp.Intersect,
-        ),
-    ):
+    if isinstance(trees[0], _QUERY_ROOTS):
         return t
 
     return None

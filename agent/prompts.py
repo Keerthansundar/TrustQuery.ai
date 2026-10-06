@@ -103,67 +103,33 @@ BUSINESS CONTEXT
 """ INTERPRET_INSTRUCTIONS, It Takes the SQL result that Python already obtained and
  turn it into a safe, user-friendly final answer without changing the numbers. """
 
-INTERPRET_INSTRUCTIONS = """The query has been executed.
-
-The AUTHORITATIVE QUERY RESULT is in the tool message above.
-
-Now write the final answer for a business user in 2-4 sentences using plain English.
+INTERPRET_INSTRUCTIONS = """The query has been executed. The AUTHORITATIVE QUERY RESULT is in the tool message above.
+Now write the final answer for a business user (2-4 sentences, plain English).
 
 NON-NEGOTIABLE RULES FOR NUMBERS
-
 1. Every number, amount, percentage, count and date in the result is authoritative ground truth from the database.
+2. Copy values EXACTLY as written in the "display" text (for example ₹42,00,000). Do not round, rescale,
+   abbreviate or convert units: no "42L", "42 lakh", "4.2 crore", "4.2M", "42K".
+3. Do not calculate new numbers. Use only values from ROWS or DERIVED VALUES. If you need a number that is
+   not provided, describe it in words instead of computing it.
+4. Keep units exactly as given: money stays in ₹ (INR), counts stay counts, percentages keep the % sign.
+5. Do not state causes that the data does not show. Describe what the numbers show.
+6. If the result is empty or truncated, say so plainly.
+7. State the period the numbers cover, based on the SQL you ran: "across all months in the data
+   (January to September 2026)" when there was no date filter, or e.g. "in September 2026". If the plan
+   assumed a comparison period, say so. Name periods by month and year only; never write day-of-month numbers.
 
-2. Copy values EXACTLY as written in the "display" text or DERIVED VALUES.
+Return JSON with: answer, reasoning_summary (one short sentence about what was compared; no step-by-step
+thinking), confidence (0-1), data_used (list of table names), requires_clarification (false)."""
 
-3. Do not round, rescale, abbreviate or convert units.
-
-4. Do not calculate new numbers.
-
-5. Use only values that exist in ROWS, display values, or DERIVED VALUES.
-
-6. Keep units exactly as given:
-   - money stays in ₹ (INR)
-   - counts stay counts
-   - percentages keep the % sign
-
-7. Do not state causes that the data does not show. Describe only what the numbers demonstrate.
-
-8. If the result is empty or truncated, say so plainly.
-
-Return JSON with:
-
-{
-  "answer": "...",
-  "reasoning_summary": "...",
-  "confidence": 0.0,
-  "data_used": ["orders", "products"],
-  "requires_clarification": false
-}
-
-reasoning_summary must be one short sentence about what was compared.
-Do NOT provide chain-of-thought or hidden reasoning.
-"""
-
-
-
-
-"""REPAIR INSTRUCTIONS are instructions given 
-to Qwen when the final answer generated numeric values by Qwen is not 
-the same as given after SQL executed (tool result) So VIOLATION captures exactly
- what needs to be done."""
-
-REPAIR_INSTRUCTIONS = """Your previous answer contains values that are NOT present in the authoritative query result.
-
-Violations:
+REPAIR_INSTRUCTIONS = """Your previous answer contains values that are NOT in the authoritative query result:
 {violations}
+Rewrite the answer. Copy every value exactly from the "display" text or DERIVED VALUES, with no rounding,
+no abbreviations, no unit conversion and no new calculations. Return the same JSON structure."""
 
-Rewrite the answer.
+NO_TOOL_NUDGE = """You replied without calling the execute_sql tool. Never answer data questions from memory and
+never write results yourself. Call the execute_sql tool now with ONE read-only SELECT query. Only if the
+question is genuinely ambiguous, reply with one short clarifying question that contains no numbers."""
 
-Rules:
-- Copy every value exactly from the authoritative result.
-- Do not round.
-- Do not abbreviate.
-- Do not convert units.
-- Do not calculate new numbers.
-- Return the same JSON structure.
-"""
+LINT_FEEDBACK = """Your query broke a business rule: {issues}
+Call execute_sql again with ONE corrected read-only SELECT query."""
