@@ -1,0 +1,305 @@
+"""Controlled tools.
+
+The LLM never touches the database directly:
+
+LLM
+    -> tool call / SQL text
+    -> Python validation
+    -> read-only SQLite
+    -> ToolResult
+    -> LLM
+"""
+
+import json
+import re
+import sqlite3
+from typing import Optional
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+
+from database.db import QueryTimeoutError, run_query
+from database.sql_validator import validate_sql
+from models.response import ToolResult
+
+
+# ---------------------------------------------------------------------------
+# Ollama tool definition
+# ---------------------------------------------------------------------------
+
+EXECUTE_SQL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute_sql",
+        "description": (
+            "Execute ONE read-only SQLite SELECT query "
+            "(WITH/CTE allowed) against the business database "
+            "and return the result. Use this for every database fact."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "A single SQLite SELECT statement.",
+                }
+            },
+            "required": ["sql"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# SQL execution
+# ---------------------------------------------------------------------------
+
+def execute_sql(sql: str) -> ToolResult:
+    """Validate and execute one read-only SQL query."""
+
+    check = validate_sql(sql)
+
+    if not check.is_valid:
+        return ToolResult(
+            success=False,
+            sql=(sql or "").strip(),
+            error=check.error,
+            error_type="validation",
+        )
+
+    try:
+        out = run_query(check.sql)
+
+    except QueryTimeoutError as exc:
+        return ToolResult(
+            success=False,
+            sql=check.sql,
+            error=str(exc),
+            error_type="timeout",
+        )
+
+    except sqlite3.Error as exc:
+        return ToolResult(
+            success=False,
+            sql=check.sql,
+            error=f"SQLite error: {exc}",
+            error_type="execution",
+        )
+
+    return ToolResult(
+        success=True,
+        sql=check.sql,
+        columns=out.columns,
+        rows=out.rows,
+        row_count=len(out.rows),
+        truncated=out.truncated,
+        elapsed_ms=out.elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SQL extraction
+# ---------------------------------------------------------------------------
+
+_FENCE = re.compile(
+    r"```(?:sql)?\s*(.*?)```",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_TOOL_TAGS = re.compile(
+    r"</?tool_call>",
+    re.IGNORECASE,
+)
+
+
+def _normalize_sql(sql: str) -> str:
+    """Normalize common LLM-generated SQL variations."""
+
+    sql = sql.replace("≥", ">=")
+    sql = sql.replace("≤", "<=")
+    sql = sql.replace("≠", "<>")
+
+    # Remove non-breaking spaces.
+    sql = sql.replace("\u00a0", " ")
+
+    return sql.strip()
+
+
+def extract_sql_from_text(text: str) -> Optional[str]:
+    """Extract SQL when a local LLM outputs SQL as plain text.
+
+    Supported formats:
+
+        SQL: SELECT ...
+
+        execute_sql: SELECT ...
+
+        SELECT ...
+
+        ```sql
+        SELECT ...
+        ```
+
+        {"arguments": {"sql": "SELECT ..."}}
+
+    The extracted SQL is returned to agent.py.
+
+    It must then be passed through execute_sql(), which performs
+    the final validation before touching the database.
+    """
+
+    if not text:
+        return None
+
+    # ---------------------------------------------------------
+    # Basic cleanup
+    # ---------------------------------------------------------
+
+    t = _TOOL_TAGS.sub("", text).strip()
+
+    if not t:
+        return None
+
+    # ---------------------------------------------------------
+    # JSON tool-call style output
+    # ---------------------------------------------------------
+
+    if t[0] in "{[":
+        try:
+            obj = json.loads(t)
+
+            if isinstance(obj, list) and obj:
+                obj = obj[0]
+
+            if isinstance(obj, dict):
+
+                # Handle:
+                # {"arguments": {"sql": "..."}}
+                # {"parameters": {"sql": "..."}}
+                args = (
+                    obj.get("arguments")
+                    or obj.get("parameters")
+                    or {}
+                )
+
+                if isinstance(args, dict) and "sql" in args:
+                    return _normalize_sql(str(args["sql"]))
+
+                # Also handle:
+                # {"sql": "..."}
+                if "sql" in obj:
+                    return _normalize_sql(str(obj["sql"]))
+
+        except (
+            ValueError,
+            AttributeError,
+            TypeError,
+            KeyError,
+        ):
+            pass
+
+    # ---------------------------------------------------------
+    # Code-fenced SQL
+    #
+    # ```sql
+    # SELECT ...
+    # ```
+    # ---------------------------------------------------------
+
+    fence = _FENCE.search(t)
+
+    if fence:
+        t = fence.group(1).strip()
+
+    # ---------------------------------------------------------
+    # Remove common SQL prefixes
+    #
+    # SQL:
+    # execute_sql:
+    # query:
+    # ---------------------------------------------------------
+
+    t = re.sub(
+        r"^\s*(?:SQL|execute_sql|query)\s*:\s*",
+        "",
+        t,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # ---------------------------------------------------------
+    # Normalize Unicode SQL operators BEFORE SQLGlot parsing.
+    #
+    # Qwen may produce:
+    #
+    # order_date ≥ '2026-09-01'
+    #
+    # Convert to:
+    #
+    # order_date >= '2026-09-01'
+    # ---------------------------------------------------------
+
+    t = _normalize_sql(t)
+
+    # ---------------------------------------------------------
+    # Remove explanation after a blank line.
+    #
+    # Example:
+    #
+    # SELECT ...
+    #
+    # This query calculates September revenue...
+    #
+    # Keep only SQL.
+    # ---------------------------------------------------------
+
+    t = t.split("\n\n")[0].strip()
+
+    if not t:
+        return None
+
+    # ---------------------------------------------------------
+    # SQL must begin with SELECT or WITH.
+    # ---------------------------------------------------------
+
+    if not re.match(r"(?is)^(SELECT|WITH)\b", t):
+        return None
+
+    # ---------------------------------------------------------
+    # Parse using SQLGlot.
+    #
+    # This checks whether the text is valid SQLite SQL.
+    # Actual security validation happens inside validate_sql().
+    # ---------------------------------------------------------
+
+    try:
+        trees = [
+            tree
+            for tree in sqlglot.parse(t, read="sqlite")
+            if tree is not None
+        ]
+
+    except SqlglotError:
+        return None
+
+    if not trees:
+        return None
+
+    # ---------------------------------------------------------
+    # Only allow SELECT-style statements here.
+    # validate_sql() performs the final safety validation.
+    # ---------------------------------------------------------
+
+    if isinstance(
+        trees[0],
+        (
+            exp.Select,
+            exp.Union,
+            exp.Except,
+            exp.Intersect,
+        ),
+    ):
+        return t
+
+    return None

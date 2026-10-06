@@ -1,0 +1,10 @@
+streamlit>=1.40
+ollama>=0.4
+pydantic>=2.7
+pydantic-settings>=2.3
+sqlglot>=25.0
+pandas>=2.0
+pytest>=8.0
+chromadb>=0.5
+sentence-transformers>=3.0
+
